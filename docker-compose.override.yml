@@ -1,0 +1,18 @@
+services:
+  backend:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+      - upload_data:/data/uploads
+
+  worker:
+    volumes:
+      - ./worker:/app
+      - upload_data:/data/uploads:ro
+
+  frontend:
+    command: npm run dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
