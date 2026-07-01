@@ -1,161 +1,95 @@
+from __future__ import annotations
+
 import asyncio
 import json
-import time
 
-import structlog
 import httpx
+import structlog
 from redis.asyncio import Redis
 
-from app.config import settings
-from app.evaluators.base import RetryableError
-from app.metrics.collector import push_metrics
-from app.retry import move_to_dlq, schedule_retry
-from app import heartbeat as hb
-from app import registry
+from agentjudge import Rubric, Trace, evaluate
+from agentjudge.schema import Criterion, JudgeConfig
+
+from worker.app.config import settings
 
 log = structlog.get_logger()
 
-# Lua script: atomically pop from ZSET + acquire lock
-CLAIM_SCRIPT = """
-local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[3], 'LIMIT', 0, 1)
-if #items == 0 then return nil end
-local payload_str = items[1]
-local ok, decoded = pcall(cjson.decode, payload_str)
-if not ok then
-    redis.call('ZREM', KEYS[1], payload_str)
-    return nil
-end
-local task_id = decoded['task_id']
-local lock_key = 'eval:lock:' .. task_id
-local acquired = redis.call('SET', lock_key, ARGV[1], 'NX', 'EX', tonumber(ARGV[2]))
-if not acquired then return nil end
-redis.call('ZREM', KEYS[1], payload_str)
-return payload_str
-"""
 
-_claim_sha: str | None = None
-
-
-async def _get_claim_sha(redis: Redis) -> str:
-    global _claim_sha
-    if _claim_sha is None:
-        _claim_sha = await redis.script_load(CLAIM_SCRIPT)
-    return _claim_sha
-
-
-async def claim_task(redis: Redis, worker_id: str) -> dict | None:
-    sha = await _get_claim_sha(redis)
-    now_ms = str(time.time() * 1000)
-    for queue in (settings.HIGH_QUEUE, settings.NORMAL_QUEUE):
-        result = await redis.evalsha(sha, 1, queue, worker_id, str(settings.TASK_LOCK_TTL), now_ms)
-        if result:
-            return json.loads(result)
-    return None
-
-
-async def release_lock(redis: Redis, task_id: str) -> None:
-    await redis.delete(f"eval:lock:{task_id}")
-
-
-async def _update_task_status(
-    http_client: httpx.AsyncClient,
-    task_id: str,
-    status: str,
-    worker_id: str | None = None,
-    error: str | None = None,
-    error_type: str | None = None,
-) -> None:
-    body: dict = {"status": status}
-    if worker_id:
-        body["worker_id"] = worker_id
-    if error:
-        body["error_message"] = error[:2000]
-    if error_type:
-        body["error_type"] = error_type
-    try:
-        await http_client.patch(
-            f"{settings.BACKEND_URL}/api/v1/tasks/{task_id}/result",
-            json=body,
-            timeout=5.0,
-        )
-    except Exception as e:
-        log.warning("status_update_failed", task_id=task_id, error=str(e))
-
-
-async def _publish_event(redis: Redis, event_type: str, data: dict) -> None:
-    from datetime import datetime, timezone
-    payload = json.dumps({"event": event_type, "data": data, "ts": datetime.now(timezone.utc).isoformat()})
-    await redis.publish(settings.SSE_CHANNEL, payload)
-
-
-async def consumer_loop(
-    worker_id: str,
-    redis: Redis,
-    http_client: httpx.AsyncClient,
-    shutdown_event: asyncio.Event,
-) -> None:
-    log.info("consumer_started", worker_id=worker_id)
-    while not shutdown_event.is_set():
-        payload = await claim_task(redis, worker_id)
-        if not payload:
-            await asyncio.sleep(settings.POLL_INTERVAL)
+async def consumer_loop(redis: Redis, http: httpx.AsyncClient, shutdown: asyncio.Event) -> None:
+    while not shutdown.is_set():
+        raw = await redis.brpop("agentjudge:runs", timeout=2)
+        if not raw:
             continue
 
-        task_id = payload["task_id"]
-        experiment_id = payload["experiment_id"]
-        attempt = payload.get("attempt", 1)
-        evaluator_type = payload.get("evaluator_type", "exact_match")
+        payload = json.loads(raw[1])
+        run_id = payload["run_id"]
+        rubric_id = payload["rubric_id"]
+        trace_ids: list[str] = payload["trace_ids"]
+        judge_cfg = JudgeConfig(**payload["judge_config"])
 
-        hb.set_current_task(task_id)
-        log.info("task_claimed", task_id=task_id, evaluator=evaluator_type, attempt=attempt)
+        log.info("run_received", run_id=run_id, traces=len(trace_ids))
 
-        await _update_task_status(http_client, task_id, "RUNNING", worker_id=worker_id)
-
-        t0 = time.monotonic()
         try:
-            evaluator = registry.get(evaluator_type)
-            result = await evaluator.evaluate(payload)
-            latency_ms = int((time.monotonic() - t0) * 1000)
-
-            await release_lock(redis, task_id)
-            await redis.hincrby(f"eval:experiment:{experiment_id}:progress", "completed", 1)
-
-            await push_metrics(http_client, task_id, experiment_id, result, latency_ms)
-            await _publish_event(redis, "task_completed", {
-                "task_id": task_id,
-                "experiment_id": experiment_id,
-                "status": "COMPLETED",
-                "latency_ms": latency_ms,
-                "metrics": result.metrics,
-            })
-
-            hb.record_completed()
-            log.info("task_completed", task_id=task_id, latency_ms=latency_ms)
-
-        except RetryableError as e:
-            await release_lock(redis, task_id)
-            await schedule_retry(redis, task_id, payload, attempt)
-            await _update_task_status(
-                http_client, task_id, "PENDING", error=str(e), error_type=type(e).__name__
+            rubric_resp = await http.get(f"{settings.BACKEND_URL}/api/v1/rubrics/{rubric_id}")
+            rubric_resp.raise_for_status()
+            rubric_data = rubric_resp.json()
+            rubric = Rubric(
+                name=rubric_data["name"],
+                criteria=[Criterion(**c) for c in rubric_data["criteria"]],
             )
-            await redis.hincrby(f"eval:experiment:{experiment_id}:progress", "failed", 1)
-            log.warning("task_retrying", task_id=task_id, attempt=attempt, error=str(e))
-
         except Exception as e:
-            await release_lock(redis, task_id)
-            await move_to_dlq(redis, task_id, payload)
-            await _update_task_status(
-                http_client, task_id, "FAILED", error=str(e), error_type=type(e).__name__
-            )
-            await redis.hincrby(f"eval:experiment:{experiment_id}:progress", "failed", 1)
-            await _publish_event(redis, "task_failed", {
-                "task_id": task_id,
-                "experiment_id": experiment_id,
-                "status": "FAILED",
-                "error": str(e)[:500],
-            })
-            hb.record_failed()
-            log.error("task_failed", task_id=task_id, error=str(e), exc_info=True)
+            log.error("rubric_fetch_failed", run_id=run_id, error=str(e))
+            continue
 
-        finally:
-            hb.set_current_task(None)
+        evals_resp = await http.get(f"{settings.BACKEND_URL}/api/v1/runs/{run_id}/evaluations")
+        evals_resp.raise_for_status()
+        evaluations = evals_resp.json()
+        eval_map = {e["trace_id"]: e["id"] for e in evaluations}
+
+        await asyncio.gather(*[
+            _evaluate_one(http, redis, run_id, trace_id, eval_map.get(trace_id), rubric, judge_cfg)
+            for trace_id in trace_ids
+        ])
+
+
+async def _evaluate_one(
+    http: httpx.AsyncClient,
+    redis: Redis,
+    run_id: str,
+    trace_id: str,
+    evaluation_id: str | None,
+    rubric: Rubric,
+    config: JudgeConfig,
+) -> None:
+    if not evaluation_id:
+        log.warning("no_evaluation_record", trace_id=trace_id)
+        return
+
+    try:
+        trace_resp = await http.get(f"{settings.BACKEND_URL}/api/v1/traces/{trace_id}")
+        trace_resp.raise_for_status()
+        trace = Trace.model_validate(trace_resp.json())
+
+        config_with_keys = config.model_copy(update={
+            "api_key": settings.ANTHROPIC_API_KEY if config.provider == "anthropic" else settings.OPENAI_API_KEY
+        })
+        result = await evaluate(trace, rubric, config_with_keys)
+
+        await http.patch(
+            f"{settings.BACKEND_URL}/api/v1/runs/{run_id}/evaluations/{evaluation_id}",
+            json={
+                "scores": [s.model_dump() for s in result.scores],
+                "overall_score": result.overall_score,
+                "passed": result.passed,
+                "reasoning": result.reasoning,
+                "status": "completed",
+            },
+        )
+        log.info("evaluation_done", trace_id=trace_id, score=result.overall_score)
+
+    except Exception as e:
+        log.error("evaluation_failed", trace_id=trace_id, error=str(e))
+        await http.patch(
+            f"{settings.BACKEND_URL}/api/v1/runs/{run_id}/evaluations/{evaluation_id}",
+            json={"error": str(e), "status": "failed"},
+        )
